@@ -1,0 +1,291 @@
+### LOAD LIBRARIES
+
+library(tidyverse)
+library(data.table)
+library(sl3)
+library(tmle3)
+library(tmle3shift)
+library(SuperLearner)
+install.packages("grf")
+library(grf)
+
+### LOAD DATA
+  
+washb_data <- fread("https://raw.githubusercontent.com/tlverse/tlverse-data/master/wash-benefits/washb_data_subset.csv", stringsAsFactors = TRUE)
+washb_data <- washb_data[!is.na(momage) & !is.na(momheight), ]
+Y <- washb_data$whz
+A <- washb_data$momage
+Wh <- data.frame(washb_data[,-c(1,7)])
+W <- matrix(0,nrow=length(A),ncol=26)
+for (i in 1:26){
+  W[,i]<-as.numeric(Wh[,i])
+}
+
+# FUNCTIONS 
+
+logloss = function(p,Y,A,my,gmy,pia,family){
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  ginvderiv <- family(model)$mu.eta
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  l = mean((g(my)-gmy-p*(A-pia))^2)
+  dl = 2*mean(gderiv(my)*(g(my)-gmy-p*(A-pia))*(Y-my))
+  l*exp(dl/l)
+}
+
+alglm.base <- function(data, family, my.pred, my.g.pred, pia, w.eff, pia.w, gmy.w){
+  #  set.seed(123)  # Setting seed for reproducibility
+  Y <- data[,1]
+  A <- data[,2]
+  
+  # Extract link function
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  # Extract the inverse link function
+  ginv <- family(model)$linkinv
+  # Extract the derivative of the inverse link function
+  ginvderiv <- family(model)$mu.eta
+  # Extract the derivative of the link function
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  # Extract the 2nd order derivative of the link function
+  if (family == "gaussian"){
+    gderiv2 <- function(p){
+      0
+    }
+  }
+  if (family == "poisson"){
+    gderiv2 <- function(p){
+      -1/p^2
+    }
+  }
+  if (family == "binomial"){
+    gderiv2 <- function(p){
+      -(1-2*p)/(p*(1-p))^2
+    }
+  }
+  # VD
+  num.eic.vd <- (A - pia)*(gderiv(my.pred)*(Y - my.pred) + g(my.pred) - my.g.pred)
+  denom.eic.vd <- (A - pia)^2
+  theta.vd <- mean(num.eic.vd)/mean(denom.eic.vd)
+  eic.vd <- (num.eic.vd - theta.vd * denom.eic.vd)/mean(denom.eic.vd)
+  # VD.imp
+  theta.vdimp <- nlm(logloss,theta.vd,Y=Y,A=A,my=my.pred,gmy=my.g.pred,pia=pia,family=family)$estimate
+  eic.vdimp <- (num.eic.vd - theta.vdimp * denom.eic.vd)/mean(denom.eic.vd)
+  # EFF
+  cl3 <- (A - pia.w)
+  my.1 <- glm(Y ~ -1 + offset(g(my.pred)) + cl3, family = family.y)
+  my.pred <- predict(my.1,type="response")
+  num.eic.eff <- (A - pia.w)*((g(my.pred) - gmy.w)*(1/gderiv(my.pred) - (gderiv2(my.pred)/gderiv(my.pred)^2)*(Y-my.pred)) + Y-my.pred)
+  denom.eic.eff <- (A - pia.w)^2*(1/gderiv(my.pred) - (gderiv2(my.pred)/gderiv(my.pred)^2)*(Y-my.pred))
+  theta.eff <- mean(num.eic.eff)/mean(denom.eic.eff)
+  eic.eff <- (num.eic.eff - theta.eff * denom.eic.eff)/mean(denom.eic.eff)
+
+  list(theta.vd = theta.vd, num.eic.vd = num.eic.vd, denom.eic.vd = denom.eic.vd, theta.vdimp = theta.vdimp, theta.eff = theta.eff, num.eic.eff = num.eic.eff, denom.eic.eff = denom.eic.eff)
+}
+
+# Function for cross-fitting in k folds
+alglm.cf <- function(data, family, family.y, family.a, SL.library.y, SL.library.a, SL.library.gy, k) {
+  #  set.seed(123)  # Setting seed for reproducibility
+  Y <- data[,1]
+  A <- data[,2]
+  
+  # Extract link function
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  # Extract the inverse link function
+  ginv <- family(model)$linkinv
+  # Extract the derivative of the inverse link function
+  ginvderiv <- family(model)$mu.eta
+  # Extract the derivative of the link function
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  # Extract the 2nd order derivative of the link function
+  if (family == "gaussian"){
+    gderiv2 <- function(p){
+      0
+    }
+  }
+  if (family == "poisson"){
+    gderiv2 <- function(p){
+      -1/p^2
+    }
+  }
+  if (family == "binomial"){
+    gderiv2 <- function(p){
+      -(1-2*p)/(p*(1-p))^2
+    }
+  }
+  
+  # Create folds
+  folds <- sample(rep(1:k, length.out = nrow(data)))
+  
+  # Initialize a vector to store the fitted values
+  my.pred = rep(NA, nrow(data))
+  my.g.pred = rep(NA, nrow(data))
+  pia = rep(NA, nrow(data))
+  w.eff = rep(NA, nrow(data))
+  pia.w = rep(NA, nrow(data))
+  gmy.w = rep(NA, nrow(data))
+
+  # Perform cross-fitting
+  for (i in 1:k) {
+    # Split the data into training and testing sets
+    if (k>1){
+      data.train <- data[folds != i, ]
+      data.eval <- data[folds == i, ]
+    }
+    if (k==1){
+      data.train <- data
+      data.eval <- data
+    }
+
+    Yt <- data.train[,1]
+    At <- data.train[,2]
+    Wt <- data.train[,-c(1,2)]
+    Y <- data.eval[,1]
+    A <- data.eval[,2]
+    W <- data.eval[,-c(1,2)]
+    
+    if (family.a == "binomial"){  
+      my <- SuperLearner(Yt,X=data.frame(At,Wt),SL.library = SL.library.y, family = family.y)
+      my.pred[folds == i] <- predict(my,newdata=data.frame(At=A,W))$pred  
+      my.pred1 <- predict(my,newdata=data.frame(At=1,W))$pred  
+      my.pred0 <- predict(my,newdata=data.frame(At=0,W))$pred  
+      ma <- SuperLearner(At,X=data.frame(Wt),SL.library = SL.library.a, family = "binomial")
+      pia[folds == i] <- predict(ma,newdata=data.frame(W))$pred  
+      my.g.pred[folds == i] <- g(my.pred1)*pia[folds == i]+g(my.pred0)*(1-pia[folds == i])
+      w.eff[folds == i] <- 1/gderiv(my.pred)
+      w.eff1 <- 1/gderiv(my.pred1)
+      w.eff0 <- 1/gderiv(my.pred0)
+      pia.w[folds == i] <- pia[folds == i]*w.eff1/(pia[folds == i]*w.eff1 + (1-pia[folds == i])*w.eff0)
+      gmy.w[folds == i] <- (g(my.pred1)*w.eff1*pia[folds == i] + g(my.pred0)*w.eff0*(1-pia[folds == i]))/(pia[folds == i]*w.eff1 + (1-pia[folds == i])*w.eff0)
+    }
+    if (family.a != "binomial"){  
+      my <- SuperLearner(Yt,X=data.frame(At,Wt),SL.library = SL.library.y, family = family.y)
+      my.pred[folds == i] <- predict(my,newdata=data.frame(At=A,W))$pred  
+      my.predt <- predict(my,newdata=data.frame(At=At,Wt))$pred  
+      my.g <- SuperLearner(g(my.predt),X=data.frame(Wt),SL.library = SL.library.gy, family = "gaussian")
+      my.g.pred[folds == i] <- predict(my.g,newdata=data.frame(W))$pred
+      ma <- SuperLearner(At,X=data.frame(Wt),SL.library = SL.library.a, family = family.a)
+      pia[folds == i] <- predict(ma,newdata=data.frame(W))$pred
+      if (family == "gaussian"){
+        gmy.w[folds == i] <- my.g.pred[folds == i]
+        pia.w[folds == i] <- pia[folds == i]
+      }
+      if (family != "gaussian"){
+        w.eff[folds == i] <- 1/gderiv(my.pred[folds == i])
+        w.efft <- 1/gderiv(my.predt)
+        my.g.eff <- regression_forest(X=Wt,Y=g(my.predt),sample.weights=w.efft,honesty=F,num.trees = 2000)
+        gmy.w[folds == i] <- predict(my.g.eff,data.frame(W))$pred  
+        ma.eff <- regression_forest(X=Wt,Y=At,sample.weights=w.efft,honesty=F,num.trees = 2000)
+        pia.w[folds == i] <- predict(ma.eff,data.frame(W))$pred  
+      }
+    }
+  }
+  out = alglm.base(data = data, family = family, my.pred, my.g.pred, pia, w.eff, pia.w, gmy.w)
+  list(theta.vd = out$theta.vd, num.eic.vd = out$num.eic.vd, denom.eic.vd = out$denom.eic.vd, theta.vdimp = out$theta.vdimp, theta.eff = out$theta.eff, num.eic.eff = out$num.eic.eff, denom.eic.eff = out$denom.eic.eff)
+}
+
+alglm <- function(Y, A, W, family = family.y, family.y, family.a, SL.library.y, SL.library.a, SL.library.gy = c("SL.glm","SL.gam","SL.ranger"), k = 5){
+  data <- cbind(Y,A,W)
+  results <- alglm.cf(data = data, family = family, family.y = family.y, family.a = family.a, SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy, k = k)
+  theta.vd <- mean(results$theta.vd)
+  theta.vdimp <- mean(results$theta.vdimp)
+  theta.eff <- mean(results$theta.eff)
+  se.vd <- sd((results$num.eic.vd - theta.vd*results$denom.eic.vd))/(mean(results$denom.eic.vd)*sqrt(nrow(data)))
+  se.vdimp <- sd((results$num.eic.vd - theta.vdimp*results$denom.eic.vd))/(mean(results$denom.eic.vd)*sqrt(nrow(data)))
+  se.eff <- sd((results$num.eic.eff - theta.eff*results$denom.eic.eff))/(mean(results$denom.eic.eff)*sqrt(nrow(data)))
+  vd <- c(theta.vd,se.vd,theta.vd-qnorm(.975)*se.vd,theta.vd+qnorm(.975)*se.vd,2*pnorm(-abs(theta.vd/se.vd)))
+  vdimp <- c(theta.vdimp,se.vdimp,theta.vdimp-qnorm(.975)*se.vdimp,theta.vdimp+qnorm(.975)*se.vdimp,2*pnorm(-abs(theta.vdimp/se.vdimp)))
+  eff <- c(theta.eff,se.eff,theta.eff-qnorm(.975)*se.eff,theta.eff+qnorm(.975)*se.eff,2*pnorm(-abs(theta.eff/se.eff)))
+  r <- rbind(vd,vdimp,eff)
+  colnames(r) <- c("Estimate","SE","Lower 95% CI","Upper 95% CI", "p-value")
+  rownames(r) <- c("Overlap", "Improved Overlap", "Efficient")
+  r
+}
+
+### FULL DATA SET
+# https://osf.io/pqzj5/files/osfstorage
+# https://tlverse.org/tlverse-workshops/stochastic-treatment-regimes-optional.html
+
+washenroll <- read.table("washb-bangladesh-enrol-public.csv",header=T,sep=",")
+wash <- read.table("washb-bangladesh-anthro-public.csv",header=T,sep=",")
+
+# MERGE DATASETS
+
+d<-merge(wash[(wash$svy==1)&(wash$childid=="T1"),],washenroll,by="dataid")
+
+### WEIGHT FOR HEIGHT Z-SCORE
+
+library(sandwich)
+Y <- d$whz
+A <- d$momage
+d$fracode[d$fracode=="D03538"]<-3538
+Wh <- data.frame(cbind(d$month,as.numeric(gsub("N", "", d$fracode)),d$Nhh,d$Nlt18,d$Ncomp,d$momheight,d$momeduy,d$dadeduy,d$hfias,d$watmin,d$elec,d$floor,d$walls,d$roof,d$asset_wardrobe,d$asset_table,d$asset_chair,d$asset_khat,d$asset_chouki,d$asset_tv,d$asset_refrig,d$asset_bike,d$asset_moto,d$asset_sewmach,d$asset_mobile))
+W <- matrix(0,nrow=length(A),ncol=ncol(Wh))
+for (i in 1:ncol(Wh)){
+  W[,i]<-as.numeric(Wh[,i])
+}
+Yh<-Y[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Ah<-A[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Wh<-W[complete.cases(W)&(!is.na(Y))&(!is.na(A)),]
+Y<-Yh
+A<-Ah
+W<-Wh
+
+summary(glm(Y~A+W))
+sqrt(sandwich(glm(Y~A+W))[2,2])
+summary(step(glm(Y~A+W[,1]+W[,2]+W[,3]+W[,4]+W[,5]+W[,6]+W[,7]+W[,8]+W[,9]+W[,10]+W[,11]+W[,12]+W[,13]+W[,14]+W[,15]+W[,16]+W[,17]+W[,18]+W[,19]+W[,20]+W[,21]+W[,22]+W[,23]+W[,24]+W[,25])))
+
+SL.library=c("SL.glm","SL.gam","SL.ranger","SL.glmnet","SL.nnet")
+SL.library.y = SL.library; SL.library.a = SL.library; SL.library.gy = SL.library
+
+alglm(Y,A,W ,k=3,family.y = "gaussian", family.a = "gaussian", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+
+### STUNTED
+  
+Y <- d$lazminus2
+A <- d$momage
+d$fracode[d$fracode=="D03538"]<-3538
+Wh <- data.frame(cbind(d$month,as.numeric(gsub("N", "", d$fracode)),d$Nhh,d$Nlt18,d$Ncomp,d$momheight,d$momeduy,d$dadeduy,d$hfias,d$watmin,d$elec,d$floor,d$walls,d$roof,d$asset_wardrobe,d$asset_table,d$asset_chair,d$asset_khat,d$asset_chouki,d$asset_tv,d$asset_refrig,d$asset_bike,d$asset_moto,d$asset_sewmach,d$asset_mobile))
+W <- matrix(0,nrow=length(A),ncol=ncol(Wh))
+for (i in 1:ncol(Wh)){
+  W[,i]<-as.numeric(Wh[,i])
+}
+Yh<-Y[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Ah<-A[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Wh<-W[complete.cases(W)&(!is.na(Y))&(!is.na(A)),]
+Y<-Yh
+A<-Ah
+W<-Wh
+
+summary(glm(Y~A+W,family=binomial))
+sqrt(sandwich(glm(Y~A+W))[2,2])
+
+summary(step(glm(Y~A+W[,1]+W[,2]+W[,3]+W[,4]+W[,5]+W[,6]+W[,7]+W[,8]+W[,9]+W[,10]+W[,11]+W[,12]+W[,13]+W[,14]+W[,15]+W[,16]+W[,17]+W[,18]+W[,19]+W[,20]+W[,21]+W[,22]+W[,23]+W[,24]+W[,25],family=binomial)))
+
+alglm(Y,A,W ,k=3,family.y = "binomial", family.a = "gaussian", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+alglm(Y,A,W ,k=3,family = "poisson", family.y = "binomial", family.a = "gaussian", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+
+# SEVERELY STUNTED
+  
+Y <- d$lazminus3
+A <- d$momage
+d$fracode[d$fracode=="D03538"]<-3538
+Wh <- data.frame(cbind(d$month,as.numeric(gsub("N", "", d$fracode)),d$Nhh,d$Nlt18,d$Ncomp,d$momheight,d$momeduy,d$dadeduy,d$hfias,d$watmin,d$elec,d$floor,d$walls,d$roof,d$asset_wardrobe,d$asset_table,d$asset_chair,d$asset_khat,d$asset_chouki,d$asset_tv,d$asset_refrig,d$asset_bike,d$asset_moto,d$asset_sewmach,d$asset_mobile))
+W <- matrix(0,nrow=length(A),ncol=ncol(Wh))
+for (i in 1:ncol(Wh)){
+  W[,i]<-as.numeric(Wh[,i])
+}
+Yh<-Y[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Ah<-A[complete.cases(W)&(!is.na(Y))&(!is.na(A))]
+Wh<-W[complete.cases(W)&(!is.na(Y))&(!is.na(A)),]
+Y<-Yh
+A<-Ah
+W<-Wh
+
+summary(glm(Y~A+W,family=binomial))
+sqrt(sandwich(glm(Y~A+W))[2,2])
+
+summary(step(glm(Y~A+W[,1]+W[,2]+W[,3]+W[,4]+W[,5]+W[,6]+W[,7]+W[,8]+W[,9]+W[,10]+W[,11]+W[,12]+W[,13]+W[,14]+W[,15]+W[,16]+W[,17]+W[,18]+W[,19]+W[,20]+W[,21]+W[,22]+W[,23]+W[,24]+W[,25],family=binomial)))
+
+alglm(Y,A,W ,k=3,family.y = "binomial", family.a = "gaussian", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
