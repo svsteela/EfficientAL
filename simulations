@@ -1,0 +1,279 @@
+### HELP FUNCTIONS
+
+install.packages("grf")
+library(SuperLearner)
+library(grf)
+
+expit <- function(x) exp(x)/(1+exp(x))
+logit <- function(x) log(x/(1-x))
+
+logloss = function(p,Y,A,my,gmy,pia,family){
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  ginvderiv <- family(model)$mu.eta
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  l = mean((g(my)-gmy-p*(A-pia))^2)
+  dl = 2*mean(gderiv(my)*(g(my)-gmy-p*(A-pia))*(Y-my))
+  l*exp(dl/l)
+}
+
+alglm.base <- function(data, family, my.pred, my.g.pred, pia, w.eff, pia.w, gmy.w){
+  #  set.seed(123)  # Setting seed for reproducibility
+  Y <- data[,1]
+  A <- data[,2]
+  
+  # Extract link function
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  # Extract the inverse link function
+  ginv <- family(model)$linkinv
+  # Extract the derivative of the inverse link function
+  ginvderiv <- family(model)$mu.eta
+  # Extract the derivative of the link function
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  # Extract the 2nd order derivative of the link function
+  if (family == "gaussian"){
+    gderiv2 <- function(p){
+      0
+    }
+  }
+  if (family == "poisson"){
+    gderiv2 <- function(p){
+      -1/p^2
+    }
+  }
+  if (family == "binomial"){
+    gderiv2 <- function(p){
+      -(1-2*p)/(p*(1-p))^2
+    }
+  }
+  # VD
+  num.eic.vd <- (A - pia)*(gderiv(my.pred)*(Y - my.pred) + g(my.pred) - my.g.pred)
+  denom.eic.vd <- (A - pia)^2
+  theta.vd <- mean(num.eic.vd)/mean(denom.eic.vd)
+  eic.vd <- (num.eic.vd - theta.vd * denom.eic.vd)/mean(denom.eic.vd)
+  # EFF
+  cl3 <- (A - pia.w)
+  my.1 <- glm(Y ~ -1 + offset(g(my.pred)) + cl3, family = family.y)
+  my.pred <- predict(my.1,type="response")
+  num.eic.eff <- (A - pia.w)*((g(my.pred) - gmy.w)*(1/gderiv(my.pred) - (gderiv2(my.pred)/gderiv(my.pred)^2)*(Y-my.pred)) + Y-my.pred)
+  denom.eic.eff <- (A - pia.w)^2*(1/gderiv(my.pred) - (gderiv2(my.pred)/gderiv(my.pred)^2)*(Y-my.pred))
+  theta.eff <- mean(num.eic.eff)/mean(denom.eic.eff)
+  eic.eff <- (num.eic.eff - theta.eff * denom.eic.eff)/mean(denom.eic.eff)
+  # VD.imp
+  theta.vdimp <- nlm(logloss,theta.eff,Y=Y,A=A,my=my.pred,gmy=my.g.pred,pia=pia,family=family)$estimate
+  eic.vdimp <- (num.eic.vd - theta.vdimp * denom.eic.vd)/mean(denom.eic.vd)
+  
+  list(theta.vd = theta.vd, num.eic.vd = num.eic.vd, denom.eic.vd = denom.eic.vd, theta.vdimp = theta.vdimp, theta.eff = theta.eff, num.eic.eff = num.eic.eff, denom.eic.eff = denom.eic.eff)
+}
+
+# Function for cross-fitting in k folds
+alglm.cf <- function(data, family, family.y, family.a, SL.library.y, SL.library.a, SL.library.gy, k) {
+  set.seed(123)  # Setting seed for reproducibility
+  Y <- data[,1]
+  A <- data[,2]
+  
+  # Extract link function
+  model <- glm(Y~A, family = family)
+  g <- family(model)$linkfun
+  # Extract the inverse link function
+  ginv <- family(model)$linkinv
+  # Extract the derivative of the inverse link function
+  ginvderiv <- family(model)$mu.eta
+  # Extract the derivative of the link function
+  gderiv <- function(p){1/ginvderiv(g(p))}
+  # Extract the 2nd order derivative of the link function
+  if (family == "gaussian"){
+    gderiv2 <- function(p){
+      0
+    }
+  }
+  if (family == "poisson"){
+    gderiv2 <- function(p){
+      -1/p^2
+    }
+  }
+  if (family == "binomial"){
+    gderiv2 <- function(p){
+      -(1-2*p)/(p*(1-p))^2
+    }
+  }
+  
+  # Create folds
+  folds <- sample(rep(1:k, length.out = nrow(data)))
+  
+  # Initialize a vector to store the fitted values
+  my.pred = rep(NA, nrow(data))
+  my.g.pred = rep(NA, nrow(data))
+  pia = rep(NA, nrow(data))
+  w.eff = rep(NA, nrow(data))
+  pia.w = rep(NA, nrow(data))
+  gmy.w = rep(NA, nrow(data))
+  
+  # Perform cross-fitting
+  for (i in 1:k) {
+    # Split the data into training and testing sets
+    if (k>1){
+      data.train <- data[folds != i, ]
+      data.eval <- data[folds == i, ]
+    }
+    if (k==1){
+      data.train <- data
+      data.eval <- data
+    }
+    
+    Yt <- data.train[,1]
+    At <- data.train[,2]
+    Wt <- data.train[,-c(1,2)]
+    Y <- data.eval[,1]
+    A <- data.eval[,2]
+    W <- data.eval[,-c(1,2)]
+    
+    if (family.a == "binomial"){  
+      my <- SuperLearner(Yt,X=data.frame(At,Wt),SL.library = SL.library.y, family = family.y)
+      my.pred[folds == i] <- predict(my,newdata=data.frame(At=A,W))$pred  
+      my.pred1 <- predict(my,newdata=data.frame(At=1,W))$pred  
+      my.pred0 <- predict(my,newdata=data.frame(At=0,W))$pred  
+      ma <- SuperLearner(At,X=data.frame(Wt),SL.library = SL.library.a, family = "binomial")
+      pia[folds == i] <- predict(ma,newdata=data.frame(W))$pred  
+      my.g.pred[folds == i] <- g(my.pred1)*pia[folds == i]+g(my.pred0)*(1-pia[folds == i])
+      w.eff[folds == i] <- 1/gderiv(my.pred)
+      w.eff1 <- 1/gderiv(my.pred1)
+      w.eff0 <- 1/gderiv(my.pred0)
+      pia.w[folds == i] <- pia[folds == i]*w.eff1/(pia[folds == i]*w.eff1 + (1-pia[folds == i])*w.eff0)
+      gmy.w[folds == i] <- (g(my.pred1)*w.eff1*pia[folds == i] + g(my.pred0)*w.eff0*(1-pia[folds == i]))/(pia[folds == i]*w.eff1 + (1-pia[folds == i])*w.eff0)
+    }
+    if (family.a != "binomial"){  
+      my <- SuperLearner(Yt,X=data.frame(At,Wt),SL.library = SL.library.y, family = family.y)
+      my.pred[folds == i] <- predict(my,newdata=data.frame(At=A,W))$pred  
+      my.predt <- predict(my,newdata=data.frame(At=At,Wt))$pred  
+      my.g <- SuperLearner(g(my.predt),X=data.frame(Wt),SL.library = SL.library.gy, family = "gaussian")
+      my.g.pred[folds == i] <- predict(my.g,newdata=data.frame(W))$pred
+      ma <- SuperLearner(At,X=data.frame(Wt),SL.library = SL.library.a, family = family.a)
+      pia[folds == i] <- predict(ma,newdata=data.frame(W))$pred
+      if (family == "gaussian"){
+        gmy.w[folds == i] <- my.g.pred[folds == i]
+        pia.w[folds == i] <- pia[folds == i]
+      }
+      if (family != "gaussian"){
+        w.eff[folds == i] <- 1/gderiv(my.pred[folds == i])
+        w.efft <- 1/gderiv(my.predt)
+        my.g.eff <- regression_forest(X=Wt,Y=g(my.predt),sample.weights=w.efft,honesty=F,num.trees = 2000)
+        gmy.w[folds == i] <- predict(my.g.eff,data.frame(W))$pred  
+        ma.eff <- regression_forest(X=Wt,Y=At,sample.weights=w.efft,honesty=F,num.trees = 2000)
+        pia.w[folds == i] <- predict(ma.eff,data.frame(W))$pred  
+      }
+    }
+  }
+  out = alglm.base(data = data, family = family, my.pred, my.g.pred, pia, w.eff, pia.w, gmy.w)
+  list(theta.vd = out$theta.vd, num.eic.vd = out$num.eic.vd, denom.eic.vd = out$denom.eic.vd, theta.vdimp = out$theta.vdimp, theta.eff = out$theta.eff, num.eic.eff = out$num.eic.eff, denom.eic.eff = out$denom.eic.eff)
+}
+
+alglm <- function(Y, A, W, family = family.y, family.y, family.a, SL.library.y, SL.library.a, SL.library.gy = c("SL.glm","SL.gam","SL.ranger"), k = 5){
+  data <- cbind(Y,A,W)
+  results <- alglm.cf(data = data, family = family, family.y = family.y, family.a = family.a, SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy, k = k)
+  theta.vd <- mean(results$theta.vd)
+  theta.vdimp <- mean(results$theta.vdimp)
+  theta.eff <- mean(results$theta.eff)
+  se.vd <- sd((results$num.eic.vd - theta.vd*results$denom.eic.vd))/(mean(results$denom.eic.vd)*sqrt(nrow(data)))
+  se.vdimp <- sd((results$num.eic.vd - theta.vdimp*results$denom.eic.vd))/(mean(results$denom.eic.vd)*sqrt(nrow(data)))
+  se.eff <- sd((results$num.eic.eff - theta.eff*results$denom.eic.eff))/(mean(results$denom.eic.eff)*sqrt(nrow(data)))
+  vd <- c(theta.vd,se.vd,theta.vd-qnorm(.975)*se.vd,theta.vd+qnorm(.975)*se.vd,2*pnorm(-abs(theta.vd/se.vd)))
+  vdimp <- c(theta.vdimp,se.vdimp,theta.vdimp-qnorm(.975)*se.vdimp,theta.vdimp+qnorm(.975)*se.vdimp,2*pnorm(-abs(theta.vdimp/se.vdimp)))
+  eff <- c(theta.eff,se.eff,theta.eff-qnorm(.975)*se.eff,theta.eff+qnorm(.975)*se.eff,2*pnorm(-abs(theta.eff/se.eff)))
+  r <- rbind(vd,vdimp,eff)
+  colnames(r) <- c("Estimate","SE","Lower 95% CI","Upper 95% CI", "p-value")
+  rownames(r) <- c("Overlap", "Improved Overlap", "Efficient")
+  r
+}
+
+### EXPERIMENT 1
+
+SL.library=c("SL.glm","SL.ranger")
+SL.library.a=SL.library.y=SL.library.gy=SL.library
+
+# POISSON
+
+n = 300
+k = 3
+res = matrix(ncol=8,nrow=1000)
+for (i in 675:1000){
+  set.seed(i)
+  W1 <- rbinom(n,1,0.6) 
+  W2 <- runif(n,0.5, 1.5) 
+  W3 <- rpois(n,2)
+  A <- rpois(n,1-W1+0.25*W3^2+2*W1*W2+4)
+  Y <- rbinom(n,1,expit(A+2*(1-W1)+0.5*W2+0.5*W3+2*W1*W2-7))
+  W <- cbind(W1,W2,W3)
+  model = glm(Y~A+W1+W2+W3, family=binomial)
+  res[i,c(1,5)] = summary(model)$coef[2,1:2]
+  r = alglm(Y,A,W,family = "binomial",family.y = "binomial", family.a = "poisson", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+  res[i,2:4] = r[,1]
+  res[i,6:8] = r[,2]
+  cat(i,res[i,],"\n")
+}
+
+# NEGATIVE BINOMIAL
+
+res = matrix(ncol=8,nrow=1000)
+for (i in 1:1000){
+  set.seed(i)
+  W1 <- rbinom(n,1,0.6) 
+  W2 <- runif(n,0.5, 1.5) 
+  W3 <- rpois(n,2)
+  A <- rnegbin(n,1-W1+0.25*W2^3+2*W1*W2+4,theta=5*W2+7)
+  Y <- rbinom(n,1,expit(A+2*(1-W1)+0.5*W2+0.5*W3+2*W1*W2-7))
+  W <- cbind(W1,W2,W3)
+  model = glm(Y~A+W1+W2+W3, family=binomial)
+  res[i,c(1,5)] = summary(model)$coef[2,1:2]
+  r = alglm(Y,A,W,family = "binomial",family.y = "binomial", family.a = "poisson", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+  res[i,2:4] = r[,1]
+  res[i,6:8] = r[,2]
+  cat(i,res[i,],"\n")
+}
+
+### EXPERIMENT 2
+
+SL.library=c("SL.glm","SL.ranger")
+SL.library.a=SL.library.y=SL.library.gy=SL.library
+
+# POISSON
+
+n = 300
+k = 3
+
+res = matrix(ncol=8,nrow=1000)
+for (i in 1:1000){
+  set.seed(i)
+  W1 <- rbinom(n,1,0.6) 
+  W2 <- runif(n,0.5, 1.5) 
+  W3 <- rpois(n,2)
+  A <- rpois(n,1-W1+0.25*W3^2+2*W1*W2+4)
+  Y <- rbinom(n,1,expit((A+2*(1-W1)+0.5*W2+0.5*W3+2*W1*W2-14)*0.2))
+  W <- cbind(W1,W2,W3)
+  model = glm(Y~A+W1+W2+W3, family=binomial)
+  res[i,c(1,5)] = summary(model)$coef[2,1:2]
+  r = alglm(Y,A,W,family = "binomial",family.y = "binomial", family.a = "poisson", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+  res[i,2:4] = r[,1]
+  res[i,6:8] = r[,2]
+  cat(i,res[i,],"\n")
+}
+
+# NEGATIVE BINOMIAL
+
+res = matrix(ncol=8,nrow=1000)
+for (i in 1:1000){
+  set.seed(i)
+  W1 <- rbinom(n,1,0.6) 
+  W2 <- runif(n,0.5, 1.5) 
+  W3 <- rpois(n,2)
+  A <- rnegbin(n,1-W1+0.25*W2^3+2*W1*W2+4,theta=5*W2+7)
+  Y <- rbinom(n,1,expit((A+2*(1-W1)+0.5*W2+0.5*W3+2*W1*W2-14)*0.2))
+  W <- cbind(W1,W2,W3)
+  model = glm(Y~A+W1+W2+W3, family=binomial)
+  res[i,c(1,5)] = summary(model)$coef[2,1:2]
+  r = alglm(Y,A,W,family = "binomial",family.y = "binomial", family.a = "poisson", SL.library.y = SL.library.y, SL.library.a = SL.library.a, SL.library.gy = SL.library.gy)
+  res[i,2:4] = r[,1]
+  res[i,6:8] = r[,2]
+  cat(i,res[i,],"\n")
+}
